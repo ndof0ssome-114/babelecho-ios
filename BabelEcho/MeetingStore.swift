@@ -43,6 +43,26 @@ final class MeetingStore {
         }.sorted { $0.createdAt > $1.createdAt }
     }
 
+    /// Repair microphone recordings left open by a crash or a killed app.
+    /// Returns how many meetings regained playable audio.
+    func recoverInterruptedRecordings() -> Int {
+        var recovered = 0
+        for var meeting in list() where meeting.wasInterrupted {
+            var audioMs = 0
+            let audio = audioURL(for: meeting)
+            if meeting.isInterruptedLiveRecording, FileManager.default.fileExists(atPath: audio.path) {
+                // An unreadable file (for example before first unlock) is
+                // retried on a later launch instead of being marked failed.
+                guard let repaired = try? WAVWriter.repair(url: audio) else { continue }
+                audioMs = repaired
+            }
+            meeting.settleInterruption(recoveredAudioMs: audioMs)
+            guard (try? save(meeting)) != nil else { continue }
+            if meeting.state == "stopped" { recovered += 1 }
+        }
+        return recovered
+    }
+
     func recoverOrphanedScreenCaptures() -> Int {
         let files = (try? FileManager.default.contentsOfDirectory(
             at: FileManager.default.temporaryDirectory, includingPropertiesForKeys: nil)) ?? []
@@ -67,35 +87,10 @@ final class MeetingStore {
 
     func export(_ meeting: Meeting, format: String) throws -> URL {
         let safeTitle = meeting.title.replacingOccurrences(of: "[/\\:]", with: "_", options: .regularExpression)
-        let fileExtension = format == "bilingual-vtt" ? "vtt" : format
-        let suffix = format == "bilingual-vtt" ? "-bilingual" : ""
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(safeTitle)-\(meeting.id.uuidString.prefix(8))\(suffix).\(fileExtension)")
-        let text: String
-        if format == "json" {
-            text = String(decoding: try encoder.encode(meeting), as: UTF8.self)
-        } else if format == "vtt" || format == "bilingual-vtt" {
-            text = "WEBVTT\n\n" + meeting.segments.map { segment in
-                let translation = format == "bilingual-vtt" && !segment.translation.isEmpty ? "\n\(segment.translation)" : ""
-                return "\(Self.timestamp(segment.startMs)) --> \(Self.timestamp(segment.endMs))\n\(segment.text)\(translation)\n"
-            }.joined(separator: "\n")
-        } else if format == "txt" {
-            text = meeting.segments.map { "[\(Self.shortTime($0.startMs))] \($0.text)" }.joined(separator: "\n")
-        } else {
-            text = "# \(meeting.title)\n\n## Summary\n\(meeting.summary)\n\n## Minutes\n\(meeting.minutes)\n\n## Transcript\n" + meeting.segments.map {
-                "- [\(Self.shortTime($0.startMs))] \($0.text)\($0.translation.isEmpty ? "" : "\n  - \($0.translation)")"
-            }.joined(separator: "\n")
-        }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "\(safeTitle)-\(meeting.id.uuidString.prefix(8))\(MeetingExport.suffix(format)).\(MeetingExport.fileExtension(format))")
+        let text = format == "json" ? String(decoding: try encoder.encode(meeting), as: UTF8.self) : MeetingExport.text(meeting, format: format)
         try text.write(to: url, atomically: true, encoding: .utf8)
         return url
-    }
-
-    private static func shortTime(_ milliseconds: Int) -> String {
-        let seconds = max(0, milliseconds / 1000)
-        return String(format: "%02d:%02d", seconds / 60, seconds % 60)
-    }
-
-    private static func timestamp(_ milliseconds: Int) -> String {
-        let value = max(0, milliseconds)
-        return String(format: "%02d:%02d:%02d.%03d", value / 3_600_000, value / 60_000 % 60, value / 1000 % 60, value % 1000)
     }
 }

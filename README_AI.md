@@ -2,7 +2,7 @@
 
 Version: `0.1.0-alpha.3`. Deployment target: iOS 17. No third-party packages.
 
-Read `AGENTS.md` and this guide first. This repository contains only the iOS application. `PRIVACY.md` and `SECURITY.md` define data handling.
+Read the monorepo root `AGENTS.md` and `README_AI.md`, then this guide. Paths here are relative to `apps/ios`. `PRIVACY.md` and `SECURITY.md` define data handling. Since 2026-11 the monorepo is the source of truth; the standalone `babelecho-ios` repository is a published snapshot (alpha.3) and should only receive exports from here.
 
 ## Architecture
 
@@ -15,10 +15,11 @@ Read `AGENTS.md` and this guide first. This repository contains only the iOS app
 - `CloudClient.swift`: user-configured MiMo, Groq/OpenAI-compatible and Deepgram ASR; Deepgram diarized utterances; task-specific text model routing. Checks HTTPS unless HTTP was explicitly enabled. Redirects remain on the original host. No request is sent until the user enables an action.
 - `MeetingStore.swift`: one `meeting.json` and `recording.wav` per meeting under Application Support. JSON writes are atomic and the meeting directory is excluded from backup.
 - `Models.swift`: versioned meeting and settings schema with optional new fields for old JSON compatibility; API keys are separate generic-password Keychain items, accessible after first unlock on this device. Provider keys use `asr.<id>` / `llm.<id>` accounts.
+- Devices: universal iPhone + iPad (`TARGETED_DEVICE_FAMILY = "1,2"`). iPad declares all four orientations so it can run in Split View / Stage Manager; iPhone keeps portrait plus landscape. The workspace column is capped at 760 pt and centred, which changes nothing at iPhone widths. History and Settings use system lists. One universal 1024 pt app icon covers both.
 
 ## Recording workflow
 
-The user confirms participant consent, then the app requests microphone permission. `AVAudioSession` uses `.playAndRecord` with `.measurement`; the project declares audio background mode. The recorder writes PCM to the local WAV as it arrives. Paused audio is not written. An interruption stops and closes the WAV. The microphone path does not promise internal audio from another app. A start reservation is taken before the asynchronous microphone-permission request, so repeated taps cannot start duplicate engines or meetings. Startup failure closes the WAV and deactivates the audio session, including invalid input-format failures.
+The user confirms participant consent, then the app requests microphone permission. `AVAudioSession` uses `.playAndRecord` with `.measurement`; the project declares audio background mode. The recorder writes PCM to the local WAV as it arrives. Paused audio is not written. An interruption stops and closes the WAV. If the app is killed or crashes first, the WAV keeps its 44-byte zero placeholder header: on the next launch `MeetingStore.recoverInterruptedRecordings()` runs before screen-capture recovery, `WAVWriter.repair(url:)` drops a torn half sample and writes the real header, and a live microphone meeting left `recording`/`paused` becomes `stopped` with the recovered duration, so it can be played and re-transcribed. Interrupted imports and screen conversions (`processing`, or `source` import/screen) and recordings without audio become `failed`; their files are never deleted. A WAV that cannot be opened (for example before first unlock) is retried on a later launch. Covered by `swift test`; a physical-device kill test is still required. The microphone path does not promise internal audio from another app. A start reservation is taken before the asynchronous microphone-permission request, so repeated taps cannot start duplicate engines or meetings. Startup failure closes the WAV and deactivates the audio session, including invalid input-format failures.
 
 Live transcription is off by default. When on and ASR is configured, voice activity opens an utterance, sends a provisional request every three seconds, and finalizes after approximately 1.2 seconds of silence. The 30-second maximum uses a 1.2-second overlap. At most six final chunks wait in the serial ASR queue; if ASR falls behind, local audio remains intact for manual retranscription. Failed ASR/LLM requests do not delete the local WAV. Manual retranscription only replaces the saved transcript after every chunk succeeds, preserving old text on failure.
 
@@ -70,3 +71,13 @@ Real provider ASR/translation/minutes, microphone signal quality, locked/backgro
 ## Standalone public repository (2026-10-14)
 
 This snapshot starts an independent iOS history at alpha.3. The original app code and test fixtures are unchanged. Personal development-team IDs were removed, and build/test paths now refer to this repository root. Never import the private monorepo history. Public releases contain a fresh unsigned Release IPA and a SHA-256 checksum; no personal provisioning profiles, signed developer packages, certificates, device identifiers, signing keys or local build logs are published. Choose your own signing team and bundle ID in Xcode for installation. The publishing workflow is documented in `docs/RELEASING.md`.
+
+## 2026-11 code review fixes
+
+- **Audio device changes**: `AudioRecorder` observes `AVAudioEngineConfigurationChange` (headphones, Bluetooth, sample-rate change) and reinstalls the tap with the new input format, resetting the resampler phase; `mediaServicesWereReset` and failed restarts call `onFailure`. Previously the engine stopped silently and the UI kept showing a running recording.
+- **Write failures** (usually a full disk) call `onFailure` once instead of being swallowed; `AppModel` stops the recording and shows the reason, keeping the audio already on disk.
+- **Live text off the ASR queue**: translation and live summary run in a separate serial chain (`textTail`), so a slow text model no longer causes final ASR chunks to be skipped. The final-chunk backlog limit is now 20 (was 6). Every segment from one recognition is translated (previously only the last one). Stop awaits both chains before minutes.
+- **Network**: `NetworkPolicy` (in `CloudClient.swift`) retries 408/425/429/5xx up to 3 attempts honouring `Retry-After` (≤ 30 s); network errors are not retried. Groq ASR keeps its own 429 gate. Provider error text is redacted of the request's key. Plain HTTP is accepted only for loopback, RFC1918, link-local, CGNAT, `.local`/`.lan`, single-label hosts and IPv6 ULA/link-local, even with HTTP enabled.
+- **ATS**: `NSAllowsArbitraryLoads` replaced by `NSAllowsLocalNetworking`, and `NSLocalNetworkUsageDescription` added. ATS still blocks plain HTTP to `.lan` names; use the IP address or a `.local` name.
+
+Verified on Linux only: Swift 6.1 compiled `Models`/`CloudClient`/`WAVWriter` and ran 21 XCTest cases (AVFoundation import tests excluded, Keychain stubbed); every Swift file passes `swiftc -parse`. **Not compiled with Xcode, not run on a simulator or device.** See `docs/HANDOFF_2026-11_REVIEW_FIXES.md` for the Mac checklist.

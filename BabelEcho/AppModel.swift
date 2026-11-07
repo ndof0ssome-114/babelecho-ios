@@ -25,7 +25,15 @@ final class AppModel: ObservableObject {
     private let defaults: UserDefaults
     private let recorder = AudioRecorder()
     private var asrTail: Task<Void, Never>?
+    /// Translation and live summary run in their own serial chain so a slow text model
+    /// never holds up speech recognition (and never causes final chunks to be skipped).
+    private var textTail: Task<Void, Never>?
     private var pendingChunks = 0
+    /// Final chunks are only skipped when this many recognitions are already waiting.
+    private static let maxPendingChunks = 20
+    /// Desktop-style sentence assembly for the live recording; only finished sentences are translated.
+    private var assembler = TranscriptAssembler()
+    private var lastChunkEndMs = 0
     private var previousASRText = ""
     private var lastSummaryAt = Date()
     private var recordingID: UUID?
@@ -77,17 +85,32 @@ final class AppModel: ObservableObject {
         if let data = defaults.data(forKey: "settings.v1"),
            let decoded = try? JSONDecoder().decode(AppSettings.self, from: data) { settings = decoded }
         else { settings = AppSettings() }
+        let recoveredRecordings = store.recoverInterruptedRecordings()
         let recoveredScreens = store.recoverOrphanedScreenCaptures()
         meetings = store.list()
         selectedID = meetings.first?.id
+        if recoveredRecordings > 0 {
+            message = L10n.text(settings.uiLanguage,
+                "已恢复 \(recoveredRecordings) 段中断的录音，可播放或重新转写",
+                "中断された録音を \(recoveredRecordings) 件復旧しました。再生や再文字起こしができます",
+                "Recovered \(recoveredRecordings) interrupted recording(s); they can be played or transcribed again")
+        }
         if recoveredScreens > 0 { message = "Recovered \(recoveredScreens) interrupted screen capture(s); open the meeting to retry audio extraction or export the original." }
         recorder.onChunk = { [weak self] chunk in self?.enqueue(chunk) }
         recorder.onLevel = { [weak self] value in
-            self?.level = value
-            self?.recordingDurationMs = self?.recorder.durationMs ?? 0
+            guard let self else { return }
+            self.level = value
+            self.recordingDurationMs = self.recorder.durationMs
+            // After a pause in speech nothing can continue the open sentence: release it for translation.
+            if let id = self.recordingID, let closed = self.assembler.closeIfStale(nowMs: self.recordingDurationMs, graceMs: 2_000) {
+                self.enqueueText(for: id, segmentIDs: [closed], client: self.client(for: id, settings: self.settings), settings: self.settings)
+            }
         }
         recorder.onInterruption = { [weak self] in
             Task { await self?.stopRecording(); self?.message = "Recording stopped because audio was interrupted" }
+        }
+        recorder.onFailure = { [weak self] reason in
+            Task { await self?.stopRecording(); self?.message = reason }
         }
     }
 
@@ -120,10 +143,14 @@ final class AppModel: ObservableObject {
         var meeting = Meeting(title: Date.now.formatted(date: .abbreviated, time: .shortened))
         meeting.language = settings.asrLanguage
         meeting.translateTo = settings.translateTo
+        meeting.mode = NotesPrompts.normalizeMode(settings.noteMode)
+        meeting.notesDetail = NotesPrompts.normalizeDetail(settings.notesDetail)
         do {
             try store.save(meeting)
             try recorder.start(url: store.audioURL(for: meeting), settings: settings)
             recordingID = meeting.id
+            assembler = TranscriptAssembler()
+            lastChunkEndMs = 0
             previousASRText = ""
             partialText = ""
             activeUtteranceID = nil
@@ -169,6 +196,13 @@ final class AppModel: ObservableObject {
         }
         await asrTail?.value
         asrTail = nil
+        // The recording is over; the last sentence is complete as it stands.
+        if let closed = assembler.closeOpen() {
+            enqueueText(for: id, segmentIDs: [closed], client: client(for: id, settings: settings), settings: settings)
+        }
+        // Minutes read the meeting; let queued translations and the last summary land first.
+        await textTail?.value
+        textTail = nil
         recordingID = nil
         if CloudClient(settings: settings).canChat(task: "minutes"),
            let meeting = meetings.first(where: { $0.id == id }), !meeting.segments.isEmpty {
@@ -181,7 +215,7 @@ final class AppModel: ObservableObject {
         if !chunk.isFinal && pendingChunks > 0 { return }
         activeUtteranceID = chunk.isFinal ? nil : chunk.utteranceID
         if chunk.isFinal { partialText = "" }
-        guard pendingChunks < 6 else {
+        guard pendingChunks < Self.maxPendingChunks else {
             message = L10n.text(settings.uiLanguage, "识别处理较慢，部分实时片段已跳过；完整录音仍在本机，可稍后重新转写。", "認識が遅いため一部のリアルタイム区間をスキップしました。録音は端末に残り、後で再認識できます。", "ASR is behind; some live chunks were skipped. The full recording remains available for retranscription.")
             return
         }
@@ -202,16 +236,34 @@ final class AppModel: ObservableObject {
                     if self.activeUtteranceID == chunk.utteranceID { self.partialText = result.text }
                     return
                 }
-                let additions = Self.makeSegments(result, startMs: chunk.startMs,
-                                                  endMs: chunk.endMs, previous: self.previousASRText)
-                guard !additions.isEmpty else { return }
+                // Audio before the previous chunk's end was already recognised there (forced-split overlap).
+                let overlapUntil = chunk.startMs < self.lastChunkEndMs ? self.lastChunkEndMs : nil
+                self.lastChunkEndMs = max(self.lastChunkEndMs, chunk.endMs)
+                let existing = self.meetings.first(where: { $0.id == id })?.segments ?? []
+                let pieces = Self.assignSpeakers(Self.makeSegments(result, startMs: chunk.startMs, endMs: chunk.endMs,
+                                                                   previous: self.previousASRText, overlapUntil: overlapUntil),
+                                                 after: existing)
+                guard !pieces.isEmpty else { return }
                 self.previousASRText = String(result.text.suffix(240))
+                let changes = pieces.map { self.assembler.add($0.text, startMs: $0.startMs, endMs: $0.endMs, speaker: $0.speaker, provider: $0.provider) }
                 self.update(id) { meeting in
-                    meeting.segments.append(contentsOf: Self.assignSpeakers(additions, after: meeting.segments))
+                    meeting.segments = changes.reduce(meeting.segments) { $1.apply(to: $0) }
                 }
-                if !snapshot.translateTo.isEmpty { await self.translateLatest(for: id, with: client, target: snapshot.translateTo) }
-                await self.summarizeIfDue(for: id, with: client, settings: snapshot)
+                let closed = changes.flatMap(\.closedIDs)
+                if !closed.isEmpty { self.enqueueText(for: id, segmentIDs: closed, client: client, settings: snapshot) }
             } catch { if chunk.isFinal { self.message = "ASR: \(error.localizedDescription)" } }
+        }
+    }
+
+    private func enqueueText(for id: UUID, segmentIDs: [UUID], client: CloudClient, settings snapshot: AppSettings) {
+        let predecessor = textTail
+        textTail = Task { [weak self] in
+            await predecessor?.value
+            guard let self else { return }
+            if !snapshot.translateTo.isEmpty {
+                await self.translateSegments(segmentIDs, for: id, with: client, target: snapshot.translateTo)
+            }
+            await self.summarizeIfDue(for: id, with: client, settings: snapshot)
         }
     }
 
@@ -228,23 +280,28 @@ final class AppModel: ObservableObject {
         defer { summarizing.remove(id) }
         do {
             let summary = try await client.incrementalSummary(previous: meeting.summary,
-                newSegments: newSegments)
+                newSegments: newSegments, title: meeting.title, mode: meeting.noteMode)
             update(id) { $0.summary = summary; $0.summaryUpTo = upTo; $0.llmCalls += 1 }
             lastSummaryAt = .now
         } catch { message = "Summary: \(error.localizedDescription)" }
     }
 
-    private func translateLatest(for id: UUID, with client: CloudClient, target: String) async {
-        guard let segment = meetings.first(where: { $0.id == id })?.segments.last else { return }
+    /// Translates every segment one recognition produced, not only the last one.
+    private func translateSegments(_ segmentIDs: [UUID], for id: UUID, with client: CloudClient, target: String) async {
+        let wanted = Set(segmentIDs)
+        guard let all = meetings.first(where: { $0.id == id })?.segments else { return }
+        let segments = all.filter { wanted.contains($0.id) && $0.translation.isEmpty }
+        guard let first = segments.first, let firstIndex = all.firstIndex(where: { $0.id == first.id }) else { return }
+        // The two sentences before the batch resolve pronouns and omitted subjects (desktop behaviour).
+        let context = all[..<firstIndex].suffix(2).map(\.text)
         do {
-            let map = try await client.translate([segment], to: target)
-            if let text = map[segment.id] {
-                update(id) { meeting in
-                    if let index = meeting.segments.firstIndex(where: { $0.id == segment.id }) {
-                        meeting.segments[index].translation = text
-                        meeting.llmCalls += 1
-                    }
+            let map = try await client.translate(segments, to: target, context: Array(context))
+            guard !map.isEmpty else { return }
+            update(id) { meeting in
+                for index in meeting.segments.indices {
+                    if let text = map[meeting.segments[index].id] { meeting.segments[index].translation = text }
                 }
+                meeting.llmCalls += 1
             }
         } catch { message = "Translation: \(error.localizedDescription)" }
     }
@@ -268,6 +325,8 @@ final class AppModel: ObservableObject {
             meeting.state = "processing"
             meeting.language = settings.asrLanguage
             meeting.translateTo = settings.translateTo
+            meeting.mode = NotesPrompts.normalizeMode(settings.noteMode)
+            meeting.notesDetail = NotesPrompts.normalizeDetail(settings.notesDetail)
             do {
                 try store.save(meeting)
                 refresh(select: meeting.id)
@@ -388,6 +447,8 @@ final class AppModel: ObservableObject {
         meeting.state = "processing"
         meeting.language = settings.asrLanguage
         meeting.translateTo = settings.translateTo
+        meeting.mode = NotesPrompts.normalizeMode(settings.noteMode)
+        meeting.notesDetail = NotesPrompts.normalizeDetail(settings.notesDetail)
         do {
             try store.save(meeting)
             refresh(select: meeting.id)
@@ -458,6 +519,9 @@ final class AppModel: ObservableObject {
             var calls = 0
             var startMs = 0
             var tail = ""
+            // Same sentence assembly as live recording and desktop.
+            var fileAssembler = TranscriptAssembler()
+            var previousEnd = 0
             while true {
                 var bytes = Data()
                 let requested = max(1, window - carry.count)
@@ -475,9 +539,14 @@ final class AppModel: ObservableObject {
                 let result = try await client.transcribeResult(wav, prompt: tail)
                 recordASRUsage(result, for: id, fallbackSeconds: Double(pcm.count) / 32_000,
                                settings: settings)
-                let additions = Self.makeSegments(result, startMs: startMs,
-                    endMs: startMs + pcm.count / 32, previous: tail)
-                segments.append(contentsOf: Self.assignSpeakers(additions, after: segments))
+                let pieces = Self.assignSpeakers(Self.makeSegments(result, startMs: startMs, endMs: startMs + pcm.count / 32,
+                                                                   previous: tail, overlapUntil: calls > 0 ? previousEnd : nil),
+                                                 after: segments)
+                for piece in pieces {
+                    segments = fileAssembler.add(piece.text, startMs: piece.startMs, endMs: piece.endMs,
+                                                 speaker: piece.speaker, provider: piece.provider).apply(to: segments)
+                }
+                previousEnd = startMs + pcm.count / 32
                 tail = String(result.text.suffix(240))
                 calls += 1
                 importStatus = L10n.text(settings.uiLanguage, "正在识别第 \(calls) 段", "\(calls) 番目の区間を認識中", "Transcribing chunk \(calls)")
@@ -544,6 +613,20 @@ final class AppModel: ObservableObject {
                 meeting.segments[index].speaker = String(clean.prefix(80))
             }
         }
+    }
+
+    /// Give one sentence a different (possibly new) speaker, like the desktop speaker menu.
+    func setSegmentSpeaker(_ segmentID: UUID, to name: String, for id: UUID) {
+        let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return }
+        update(id) { meeting in
+            if let index = meeting.segments.firstIndex(where: { $0.id == segmentID }) { meeting.segments[index].speaker = String(clean.prefix(60)) }
+        }
+    }
+
+    /// Scene and notes detail of one meeting; existing notes stay until regenerated (desktop behaviour).
+    func setNoteOptions(mode: String, detail: String, for id: UUID) {
+        update(id) { $0.mode = NotesPrompts.normalizeMode(mode); $0.notesDetail = NotesPrompts.normalizeDetail(detail) }
     }
 
     func resplitSpeakers(for id: UUID) async {
@@ -640,31 +723,24 @@ final class AppModel: ObservableObject {
         selectedID = id ?? selectedID.flatMap { current in meetings.contains(where: { $0.id == current }) ? current : nil } ?? meetings.first?.id
     }
 
-    private static func trimOverlap(previous: String, current: String) -> String {
-        let current = current.trimmingCharacters(in: .whitespacesAndNewlines)
-        let previous = previous.trimmingCharacters(in: .whitespacesAndNewlines)
-        let maximum = min(120, previous.count, current.count)
-        if maximum >= 4 {
-            for count in stride(from: maximum, through: 4, by: -1) {
-                if previous.suffix(count).lowercased() == current.prefix(count).lowercased() {
-                    return String(current.dropFirst(count)).trimmingCharacters(in: .whitespacesAndNewlines)
-                }
-            }
-        }
-        return current
-    }
 
-    private static func makeSegments(_ result: ASRResult, startMs: Int, endMs: Int, previous: String) -> [TranscriptSegment] {
+    /// Pieces of one recognition result. Like desktop, text is only de-duplicated where the audio
+    /// overlaps the previous chunk (`overlapUntil`), and that overlap belongs to the previous chunk.
+    static func makeSegments(_ result: ASRResult, startMs: Int, endMs: Int, previous: String, overlapUntil: Int? = nil) -> [TranscriptSegment] {
         if result.utterances.isEmpty {
-            let text = trimOverlap(previous: previous, current: result.text)
-            return text.isEmpty ? [] : [TranscriptSegment(startMs: startMs, endMs: endMs,
+            let text = overlapUntil == nil ? result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                : Sentences.trimRepeatedPrefix(previous: previous, current: result.text)
+            return text.isEmpty ? [] : [TranscriptSegment(startMs: max(startMs, overlapUntil ?? startMs), endMs: endMs,
                 text: text, provider: result.provider)]
         }
-        return result.utterances.enumerated().compactMap { index, utterance in
-            let text = index == 0 ? trimOverlap(previous: previous, current: utterance.text) : utterance.text
-            guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-            return TranscriptSegment(startMs: startMs + Int(utterance.startSeconds * 1000),
-                endMs: min(endMs, startMs + Int(utterance.endSeconds * 1000)), text: text,
+        return result.utterances.compactMap { utterance in
+            let start = startMs + Int(utterance.startSeconds * 1000)
+            let end = min(endMs, startMs + Int(utterance.endSeconds * 1000))
+            if let overlapUntil, end <= overlapUntil { return nil }
+            let text = overlapUntil.map { start < $0 } == true ? Sentences.trimRepeatedPrefix(previous: previous, current: utterance.text)
+                : utterance.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return nil }
+            return TranscriptSegment(startMs: max(start, overlapUntil ?? start), endMs: end, text: text,
                 speaker: utterance.speaker, provider: result.provider)
         }
     }

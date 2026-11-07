@@ -64,6 +64,8 @@ private struct WorkspaceView: View {
     @State private var seekRequest: SeekRequest?
     @State private var renameSource: String?
     @State private var renameDraft = ""
+    /// The sentence whose speaker was tapped, for "this sentence only" (desktop set-segment-speaker).
+    @State private var renameSegment: UUID?
     @State private var copied = false
 
     var body: some View {
@@ -84,6 +86,9 @@ private struct WorkspaceView: View {
                 }
             }
             .padding()
+            // Keep a readable column on iPad; no effect at iPhone widths.
+            .frame(maxWidth: 760)
+            .frame(maxWidth: .infinity)
         }
         .background(LinearGradient(
             colors: colorScheme == .dark
@@ -259,23 +264,15 @@ private struct WorkspaceView: View {
                         Button(String(format: "%02d:%02d", segment.startMs / 60_000, segment.startMs / 1000 % 60)) {
                             seekRequest = SeekRequest(milliseconds: segment.startMs)
                         }.font(.caption.monospacedDigit())
-                        Button(segment.speaker) { renameSource = segment.speaker; renameDraft = segment.speaker }
+                        Button(segment.speaker) { renameSource = segment.speaker; renameSegment = segment.id; renameDraft = segment.speaker }
                             .font(.caption.weight(.semibold))
                         Text(segment.text).textSelection(.enabled)
                         if !segment.translation.isEmpty { Text(segment.translation).foregroundStyle(.indigo).textSelection(.enabled) }
                     }.frame(maxWidth: .infinity, alignment: .leading)
+                    // The editor opens right under the tapped sentence, not after the whole list,
+                    // so it is visible without scrolling in a long meeting.
+                    if renameSegment == segment.id, let renameSource { speakerEditor(meeting, source: renameSource) }
                     Divider()
-                }
-                if let renameSource {
-                    HStack {
-                        TextField(t("说话人名称", "話者名", "Speaker name"), text: $renameDraft)
-                            .textFieldStyle(.roundedBorder)
-                        Button(t("保存", "保存", "Save")) {
-                            model.renameSpeaker(renameSource, to: renameDraft, for: meeting.id)
-                            self.renameSource = nil
-                        }
-                        Button(t("取消", "キャンセル", "Cancel")) { self.renameSource = nil }
-                    }
                 }
                 Button(t("智能区分说话人", "AI で話者を区分", "AI speaker split")) {
                     Task { await model.resplitSpeakers(for: meeting.id) }
@@ -288,7 +285,10 @@ private struct WorkspaceView: View {
                 Task { await model.summarize(for: meeting.id) }
             }
         case .minutes:
-            textPanel(meeting.minutes, empty: t("暂无纪要", "議事録はまだありません", "No minutes yet"), action: t("生成纪要", "議事録を作成", "Create minutes")) {
+            noteOptions(meeting)
+            let isClass = meeting.noteMode == NotesPrompts.classroom
+            textPanel(meeting.minutes, empty: isClass ? t("暂无课程笔记", "授業ノートはまだありません", "No class notes yet") : t("暂无纪要", "議事録はまだありません", "No minutes yet"),
+                      action: isClass ? t("生成笔记", "ノートを作成", "Create notes") : t("生成纪要", "議事録を作成", "Create minutes")) {
                 Task { await model.createMinutes(for: meeting.id) }
             }
         case .ask:
@@ -368,10 +368,59 @@ private struct WorkspaceView: View {
 
     private func textPanel(_ value: String, empty: String, action: String, perform: @escaping () -> Void) -> some View {
         card {
-            Text(value.isEmpty ? empty : value).frame(maxWidth: .infinity, alignment: .leading)
+            Group {
+                if value.isEmpty { Text(empty) } else { MarkdownView(markdown: value) }
+            }.frame(maxWidth: .infinity, alignment: .leading)
                 .textSelection(.enabled)
             Button(action, action: perform).disabled(model.busy || model.selected?.segments.isEmpty != false)
         }
+    }
+
+    /// Speaker change for one sentence or everywhere (desktop speaker menu).
+    @ViewBuilder private func speakerEditor(_ meeting: Meeting, source: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            TextField(t("说话人名称", "話者名", "Speaker name"), text: $renameDraft)
+                .textFieldStyle(.roundedBorder)
+            let known = Array(Set(meeting.segments.map(\.speaker))).filter { $0 != source && !$0.isEmpty }.sorted()
+            if !known.isEmpty {
+                ScrollView(.horizontal) {
+                    HStack { ForEach(known, id: \.self) { name in Button(name) { renameDraft = name }.buttonStyle(.bordered) } }
+                }
+            }
+            Text(t("改成已有名字时，「全部改名」会合并这两位说话人。", "既存の名前にすると「すべて変更」で話者が統合されます。", "Renaming everywhere to an existing name merges the two speakers."))
+                .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                if let segmentID = renameSegment {
+                    Button(t("只改这一句", "この文だけ", "This sentence")) {
+                        model.setSegmentSpeaker(segmentID, to: renameDraft, for: meeting.id)
+                        self.renameSource = nil
+                    }
+                }
+                Button(t("全部改名", "すべて変更", "Everywhere")) {
+                    model.renameSpeaker(source, to: renameDraft, for: meeting.id)
+                    self.renameSource = nil
+                }
+                Button(t("取消", "キャンセル", "Cancel")) { self.renameSource = nil }
+            }
+        }
+    }
+
+    /// Scene (meeting/class) and notes detail of this meeting, as on the desktop notes panel.
+    private func noteOptions(_ meeting: Meeting) -> some View {
+        card {
+            Picker(t("使用场景", "利用シーン", "Scene"), selection: Binding(
+                get: { meeting.noteMode }, set: { model.setNoteOptions(mode: $0, detail: meeting.noteDetail, for: meeting.id) })) {
+                Text(t("会议", "会議", "Meeting")).tag(NotesPrompts.meeting)
+                Text(t("上课", "授業", "Class")).tag(NotesPrompts.classroom)
+            }.pickerStyle(.segmented)
+            Picker(t("纪要详细度", "詳しさ", "Notes detail"), selection: Binding(
+                get: { meeting.noteDetail }, set: { model.setNoteOptions(mode: meeting.noteMode, detail: $0, for: meeting.id) })) {
+                Text(t("详细", "詳細", "Detailed")).tag(NotesPrompts.detailed)
+                Text(t("标准", "標準", "Standard")).tag(NotesPrompts.standard)
+            }.pickerStyle(.segmented)
+            Text(t("切换后已有内容保留，请重新生成。", "切り替えても既存の内容は残ります。再生成してください。", "Existing notes are kept; regenerate to apply."))
+                .font(.caption).foregroundStyle(.secondary)
+        }.disabled(model.busy)
     }
 
     private func exportCard(_ meeting: Meeting) -> some View {
@@ -379,8 +428,8 @@ private struct WorkspaceView: View {
             Text(t("导出", "書き出し", "Export")).font(.headline)
             ScrollView(.horizontal) {
                 HStack {
-                ForEach(["md", "txt", "vtt", "bilingual-vtt", "json"], id: \.self) { format in
-                    Button(format.uppercased()) {
+                ForEach(["md", "md-notes", "txt", "vtt", "bilingual-vtt", "srt", "json"], id: \.self) { format in
+                    Button(format == "md-notes" ? t("MD 不含转写", "MD（文字起こしなし）", "MD without transcript") : format.uppercased()) {
                         if let url = model.export(meeting.id, format: format) { sharedFile = SharedFile(url: url) }
                     }
                     .buttonStyle(.bordered)
@@ -625,6 +674,16 @@ private struct SettingsView: View {
                 TextField("Minutes model (optional)", text: $draft.minutesModel)
                 TextField("Translation model (optional)", text: $draft.translationModel)
                 TextField("Ask model (optional)", text: $draft.askModel)
+                Picker(t("使用场景", "利用シーン", "Scene"), selection: Binding(
+                    get: { NotesPrompts.normalizeMode(draft.noteMode) }, set: { draft.noteMode = $0 })) {
+                    Text(t("会议：决议、待办、风险", "会議：決定・タスク・リスク", "Meeting: decisions, actions, risks")).tag(NotesPrompts.meeting)
+                    Text(t("上课：概念、例题、复习问答", "授業：概念・例題・復習", "Class: concepts, examples, review")).tag(NotesPrompts.classroom)
+                }
+                Picker(t("纪要详细度", "議事録の詳しさ", "Notes detail"), selection: Binding(
+                    get: { NotesPrompts.normalizeDetail(draft.notesDetail) }, set: { draft.notesDetail = $0 })) {
+                    Text(t("详细", "詳細", "Detailed")).tag(NotesPrompts.detailed)
+                    Text(t("标准", "標準", "Standard")).tag(NotesPrompts.standard)
+                }
                 Picker(t("翻译目标", "翻訳先", "Translate to"), selection: $draft.translateTo) {
                     Text("Off").tag(""); Text("中文").tag("zh"); Text("日本語").tag("ja"); Text("English").tag("en")
                     Text("한국어").tag("ko"); Text("Français").tag("fr"); Text("Deutsch").tag("de"); Text("Español").tag("es")
@@ -788,4 +847,55 @@ private struct TaskModelEditor: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(16)
         .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 20))
+}
+
+/// Summaries and notes as headings, lists and tables instead of raw `#` and `|` (see MarkdownBlock).
+private struct MarkdownView: View {
+    let markdown: String
+
+    private func inline(_ text: String) -> Text {
+        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        return Text((try? AttributedString(markdown: text, options: options)) ?? AttributedString(text))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(Array(MarkdownBlock.parse(markdown).enumerated()), id: \.offset) { _, block in
+                switch block {
+                case .heading(let level, let text):
+                    inline(text).font(level <= 1 ? .title3.bold() : level == 2 ? .headline : .subheadline.bold())
+                        .padding(.top, level <= 2 ? 6 : 2)
+                case .bullet(let text, let depth, let marker):
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(marker).foregroundStyle(.indigo)
+                        inline(text)
+                    }.padding(.leading, CGFloat(depth) * 14)
+                case .table(let header, let rows):
+                    ScrollView(.horizontal) {
+                        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 6) {
+                            GridRow { ForEach(Array(header.enumerated()), id: \.offset) { _, cell in inline(cell).font(.caption.bold()) } }
+                            Divider()
+                            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                                GridRow {
+                                    ForEach(0..<max(header.count, row.count), id: \.self) { index in
+                                        inline(index < row.count ? row[index] : "").font(.caption)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                case .quote(let text):
+                    inline(text).foregroundStyle(.secondary).padding(.leading, 10)
+                case .code(let text):
+                    Text(text).font(.caption.monospaced()).padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+                case .paragraph(let text):
+                    inline(text)
+                case .rule:
+                    Divider()
+                }
+            }
+        }
+    }
 }

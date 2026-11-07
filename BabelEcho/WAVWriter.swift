@@ -13,6 +13,7 @@ final class WAVWriter {
         try FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: url.path)
         #endif
         handle = try FileHandle(forWritingTo: url)
+        // forWritingTo opens at offset 0; samples belong after the placeholder.
         try handle.seek(toOffset: 44)
     }
 
@@ -37,6 +38,21 @@ final class WAVWriter {
     }
 
     deinit { try? close() }
+
+    /// Finish a WAV whose writer never reached `close()` because the app was
+    /// killed or crashed mid-recording: drop a torn half sample and write the
+    /// real header over the 44-byte placeholder. Returns the duration in ms.
+    static func repair(url: URL) throws -> Int {
+        let handle = try FileHandle(forUpdating: url)
+        defer { try? handle.close() }
+        let size = Int(try handle.seekToEnd())
+        guard size > 44 else { return 0 }
+        let bytes = (size - 44) & ~1
+        try handle.truncate(atOffset: UInt64(44 + bytes))
+        try handle.seek(toOffset: 0)
+        try handle.write(contentsOf: header(bytes: bytes))
+        return bytes / 32 // 16 kHz mono 16-bit = 32 bytes per millisecond
+    }
 
     static func header(bytes: Int) -> Data {
         var data = Data()
