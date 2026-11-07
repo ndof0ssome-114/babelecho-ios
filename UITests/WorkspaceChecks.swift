@@ -9,6 +9,11 @@ final class WorkspaceChecks: XCTestCase {
         app.launch()
         XCTAssertTrue(app.textFields["Meeting title"].waitForExistence(timeout: 10))
     }
+    /// iPhone shows a bottom UITabBar; iPad shows the tabs at the top, outside any tab bar.
+    private func tab(_ name: String) -> XCUIElement {
+        let bar = app.tabBars.buttons[name]
+        return bar.exists ? bar : app.buttons[name].firstMatch
+    }
     private func attachment(_ name: String) {
         let item = XCTAttachment(screenshot: app.screenshot())
         item.name = name
@@ -27,7 +32,7 @@ final class WorkspaceChecks: XCTestCase {
         attachment("summary-and-copy")
     }
     func testProviderChangeClearsModelAndDraftSurvivesTabSwitch() {
-        app.tabBars.buttons["Settings"].tap()
+        tab("Settings").tap()
         app.buttons.matching(NSPredicate(format: "label CONTAINS 'Summary' AND label CONTAINS 'deepseek' ")).firstMatch.tap()
         let field = app.textFields["model-summary"]
         XCTAssertTrue(field.waitForExistence(timeout: 5))
@@ -37,8 +42,8 @@ final class WorkspaceChecks: XCTestCase {
         XCTAssertEqual(field.value as? String, "Model ID")
         field.tap()
         field.typeText("typed-custom-model")
-        app.tabBars.buttons["History"].tap()
-        app.tabBars.buttons["Settings"].tap()
+        tab("History").tap()
+        tab("Settings").tap()
         XCTAssertEqual(app.textFields["model-summary"].value as? String, "typed-custom-model")
         attachment("custom-model-draft")
     }
@@ -79,7 +84,7 @@ final class WorkspaceChecks: XCTestCase {
         app.alerts.buttons["Cancel"].tap()
         XCTAssertTrue(app.buttons["Start recording"].exists)
         XCTAssertFalse(app.buttons["Stop recording"].exists)
-        app.tabBars.buttons["History"].tap()
+        tab("History").tap()
         XCTAssertTrue(app.staticTexts["Synthetic UI test"].exists)
         attachment("history-local-fixture")
     }

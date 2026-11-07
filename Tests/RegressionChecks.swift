@@ -159,4 +159,63 @@ final class RegressionChecks: XCTestCase {
         do { _ = try await MediaImporter.convertToWAV(source: source, destination: target); XCTFail("Invalid media accepted") }
         catch { XCTAssertEqual(try Data(contentsOf: target), old) }
     }
+
+    // MARK: 2026-11 review fixes
+
+    func testPlainHTTPIsOnlyForLocalNetworks() {
+        for host in ["127.0.0.1", "localhost", "10.0.0.8", "192.168.1.20", "172.16.0.9", "nas", "gpu.local", "[::1]", "fd00::5", "fe80::1"] {
+            XCTAssertTrue(NetworkPolicy.isLocalNetworkHost(host), host)
+        }
+        for host in ["api.example.com", "8.8.8.8", "172.32.1.1", "2001:db8::1", "", "999.1.1.1"] {
+            XCTAssertFalse(NetworkPolicy.isLocalNetworkHost(host), host)
+        }
+    }
+
+    func testPublicHTTPRejectedEvenWhenHTTPIsEnabledButLocalHTTPAllowed() async throws {
+        var settings = AppSettings()
+        settings.allowInsecureHTTP = true
+        var reached: [String] = []
+        let client = CloudClient(settings: settings, credentials: { _ in "" }, transport: { request in
+            reached.append(request.url!.host ?? "")
+            return try self.response(request, ["data": [["id": "local-model"]]])
+        })
+        do { _ = try await client.discoverModels(baseURL: "http://api.example.com/v1", key: "", noAuth: true); XCTFail("public HTTP accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("HTTPS")) }
+        let models = try await client.discoverModels(baseURL: "http://192.168.1.5:11434/v1", key: "", noAuth: true)
+        XCTAssertEqual(models, ["local-model"])
+        XCTAssertEqual(reached, ["192.168.1.5"])
+    }
+
+    func testRetryDelaysFollowRetryAfter() {
+        XCTAssertEqual(NetworkPolicy.retryDelay(status: 429, retryAfter: "2", attempt: 0), 2)
+        XCTAssertEqual(NetworkPolicy.retryDelay(status: 429, retryAfter: "600", attempt: 0), 30)
+        XCTAssertEqual(NetworkPolicy.retryDelay(status: 503, retryAfter: nil, attempt: 1), 2)
+        XCTAssertNil(NetworkPolicy.retryDelay(status: 429, retryAfter: "1", attempt: NetworkPolicy.maxAttempts - 1))
+        XCTAssertNil(NetworkPolicy.retryDelay(status: 401, retryAfter: nil, attempt: 0))
+        XCTAssertEqual(NetworkPolicy.redact("bad key sk-secret-123", authorization: "Bearer sk-secret-123"), "bad key [redacted]")
+    }
+
+    func testTransientFailureIsRetriedAndKeysAreRedacted() async throws {
+        var calls = 0
+        let client = CloudClient(settings: AppSettings(), credentials: { _ in "" }, transport: { request in
+            calls += 1
+            if calls == 1 { return try self.response(request, ["error": ["message": "busy"]], status: 503) }
+            return try self.response(request, ["data": [["id": "m"]]])
+        })
+        let models = try await client.discoverModels(baseURL: "https://custom.example/v1", key: "sk-visible-key", noAuth: false)
+        XCTAssertEqual(models, ["m"])
+        XCTAssertEqual(calls, 2)
+
+        calls = 0
+        let rejecting = CloudClient(settings: AppSettings(), credentials: { _ in "" }, transport: { request in
+            calls += 1
+            return try self.response(request, ["error": ["message": "invalid key sk-visible-key"]], status: 401)
+        })
+        do { _ = try await rejecting.discoverModels(baseURL: "https://custom.example/v1", key: "sk-visible-key", noAuth: false); XCTFail("401 accepted") }
+        catch {
+            XCTAssertEqual(calls, 1, "401 is not retried")
+            XCTAssertFalse(error.localizedDescription.contains("sk-visible-key"))
+            XCTAssertTrue(error.localizedDescription.contains("[redacted]"))
+        }
+    }
 }

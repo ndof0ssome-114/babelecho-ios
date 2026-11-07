@@ -9,7 +9,7 @@ private final class RedirectGuard: NSObject, URLSessionTaskDelegate {
         guard let scheme = request.url?.scheme?.lowercased(),
               let destination = request.url?.host?.lowercased(),
               destination == task.originalRequest?.url?.host?.lowercased(),
-              scheme == "https" || (allowHTTP && scheme == "http") else {
+              scheme == "https" || (allowHTTP && scheme == "http" && NetworkPolicy.isLocalNetworkHost(destination)) else {
             completionHandler(nil); return
         }
         completionHandler(request)
@@ -36,10 +36,64 @@ struct ReportedTextUsage {
     var reasoningTokens: Int? = nil
 }
 
+/// Pure network rules shared by every provider call.
+enum NetworkPolicy {
+    static let maxAttempts = 3
+    private static let retryStatus: Set<Int> = [408, 425, 429, 500, 502, 503, 504]
+
+    /// Plain HTTP is only for engines on this device or the local network (Ollama, LM Studio,
+    /// whisper.cpp); anything else would carry audio, transcripts and keys unencrypted.
+    static func isLocalNetworkHost(_ hostname: String) -> Bool {
+        var host = hostname.lowercased()
+        if host.hasPrefix("[") && host.hasSuffix("]") { host = String(host.dropFirst().dropLast()) }
+        if host.isEmpty { return false }
+        if !host.contains(".") && !host.contains(":") { return true }
+        if host == "localhost" || host.hasSuffix(".localhost") || host.hasSuffix(".local") || host.hasSuffix(".lan") { return true }
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        if parts.count == 4, let octets = Optional(parts.compactMap { Int($0) }), octets.count == 4,
+           octets.allSatisfy({ (0...255).contains($0) }) {
+            let a = octets[0], b = octets[1]
+            return a == 127 || a == 10 || (a == 172 && (16...31).contains(b)) || (a == 192 && b == 168) ||
+                (a == 169 && b == 254) || (a == 100 && (64...127).contains(b))
+        }
+        if host.contains(":") {
+            if host == "::1" { return true }
+            let first = host.split(separator: ":").first.map(String.init) ?? ""
+            guard first.count == 4, let value = Int(first, radix: 16) else { return false }
+            return (0xfc00...0xfdff).contains(value) || (0xfe80...0xfebf).contains(value)
+        }
+        return false
+    }
+
+    /// Seconds before retrying, or nil when the failure must not be retried. Network errors
+    /// are never retried here: a timed-out request may already have been billed.
+    static func retryDelay(status: Int, retryAfter: String?, attempt: Int, now: Date = .now) -> Double? {
+        guard retryStatus.contains(status), attempt + 1 < maxAttempts else { return nil }
+        let header = retryAfter?.trimmingCharacters(in: .whitespaces) ?? ""
+        var seconds = Double(header)
+        if seconds == nil, !header.isEmpty {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = TimeZone(identifier: "GMT")
+            formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+            seconds = formatter.date(from: header).map { $0.timeIntervalSince(now) }
+        }
+        if let value = seconds, value > 0 { return min(30, value) }
+        return Double(attempt + 1)
+    }
+
+    /// Removes the request's own credential from provider error text before it is shown.
+    static func redact(_ text: String, authorization: String?) -> String {
+        guard let secret = authorization?.split(separator: " ").last.map(String.init), secret.count >= 4 else { return text }
+        return text.replacingOccurrences(of: secret, with: "[redacted]")
+    }
+}
+
 private struct HTTPFailure: LocalizedError {
     let status: Int
     let detail: String
     let retryAfter: Double?
+    var retryAfterHeader: String? = nil
     var errorDescription: String? { "HTTP \(status): \(detail)" }
 }
 
@@ -122,15 +176,31 @@ struct CloudClient {
 
     private func endpoint(_ base: String, path: String) throws -> URL {
         guard let url = URL(string: base.trimmingCharacters(in: .whitespacesAndNewlines)),
-              let scheme = url.scheme?.lowercased(), url.host != nil,
-              scheme == "https" || (settings.allowInsecureHTTP && scheme == "http"),
+              let scheme = url.scheme?.lowercased(), let host = url.host,
+              scheme == "https" || (settings.allowInsecureHTTP && scheme == "http" && NetworkPolicy.isLocalNetworkHost(host)),
               url.user == nil, url.password == nil, url.query == nil, url.fragment == nil else {
-            throw AppError.message("Use an HTTPS endpoint, or explicitly enable HTTP for a trusted service")
+            throw AppError.message("Use an HTTPS endpoint. Plain HTTP is only allowed to this device or the local network, after enabling it")
         }
         return url.appendingPathComponent(path)
     }
 
-    private func send(_ request: URLRequest) async throws -> Data {
+    /// Sends a request, retrying rate limits and transient server errors after Retry-After.
+    /// Groq ASR passes `retryRateLimits: false` because its own rate gate handles 429.
+    private func send(_ request: URLRequest, retryRateLimits: Bool = true) async throws -> Data {
+        var attempt = 0
+        while true {
+            do { return try await sendOnce(request) }
+            catch let failure as HTTPFailure {
+                guard retryRateLimits || failure.status != 429,
+                      let delay = NetworkPolicy.retryDelay(status: failure.status, retryAfter: failure.retryAfterHeader, attempt: attempt)
+                else { throw failure }
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                attempt += 1
+            }
+        }
+    }
+
+    private func sendOnce(_ request: URLRequest) async throws -> Data {
         let data: Data
         let http: HTTPURLResponse
         if let transport {
@@ -147,9 +217,12 @@ struct CloudClient {
         guard (200...299).contains(http.statusCode) else {
             let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             let provider = (object?["error"] as? [String: Any])?["message"] as? String
-            let detail = provider ?? String(decoding: data.prefix(300), as: UTF8.self)
-            let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
-            throw HTTPFailure(status: http.statusCode, detail: String(detail.prefix(300)), retryAfter: retryAfter)
+            let raw = provider ?? String(decoding: data.prefix(300), as: UTF8.self)
+            // Some providers echo the submitted key in their error text.
+            let detail = NetworkPolicy.redact(raw, authorization: request.value(forHTTPHeaderField: "Authorization"))
+            let header = http.value(forHTTPHeaderField: "Retry-After")
+            throw HTTPFailure(status: http.statusCode, detail: String(detail.prefix(300)),
+                              retryAfter: header.flatMap(Double.init), retryAfterHeader: header)
         }
         return data
     }
@@ -170,7 +243,8 @@ struct CloudClient {
             let attempts = provider.id == "groq" ? 4 : 1
             for attempt in 0..<attempts {
                 if provider.id == "groq" { try await GroqRateGate.shared.waitForSlot() }
-                do { return try await transcribeOpenAI(wav, prompt: prompt, provider: provider, key: key, language: language) }
+                do { return try await transcribeOpenAI(wav, prompt: prompt, provider: provider, key: key, language: language,
+                                                       retryRateLimits: provider.id != "groq") }
                 catch let failure as HTTPFailure where provider.id == "groq" && failure.status == 429 && attempt + 1 < attempts {
                     await GroqRateGate.shared.deferNext(min(60, max(1, failure.retryAfter ?? 5)))
                 }
@@ -179,7 +253,8 @@ struct CloudClient {
         }
     }
 
-    private func transcribeOpenAI(_ wav: Data, prompt: String, provider: ASRProvider, key: String, language: String) async throws -> ASRResult {
+    private func transcribeOpenAI(_ wav: Data, prompt: String, provider: ASRProvider, key: String, language: String,
+                                  retryRateLimits: Bool = true) async throws -> ASRResult {
         let url = try endpoint(provider.baseURL, path: "audio/transcriptions")
         let boundary = UUID().uuidString
         var body = Data()
@@ -200,7 +275,7 @@ struct CloudClient {
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         if !key.isEmpty { request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
         request.httpBody = body
-        let data = try await send(request)
+        let data = try await send(request, retryRateLimits: retryRateLimits)
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let text = object["text"] as? String else { throw AppError.message("ASR response has no text") }
         let items = object["segments"] as? [[String: Any]] ?? []
@@ -286,7 +361,7 @@ struct CloudClient {
             "messages": [["role": "system", "content": system], ["role": "user", "content": user]]
         ]
         let usesThinking = ModelRole.isDeepSeek(baseURL) && thinking != "disabled"
-        object["max_tokens"] = usesThinking ? 16_384 : (task == "minutes" ? 8_192 : 4_096)
+        object["max_tokens"] = usesThinking || task == "minutes" ? 16_384 : 4_096 // detailed notes need room, as on desktop
         if ModelRole.isDeepSeek(baseURL), let thinking, ["enabled", "disabled"].contains(thinking) {
             object["thinking"] = ["type": thinking]
         }
@@ -334,100 +409,110 @@ struct CloudClient {
         return models
     }
 
-    func incrementalSummary(previous: String, newSegments: [TranscriptSegment]) async throws -> String {
-        let transcript = Self.render(newSegments)
-        return try await chat(task: "summary", system:
-            "Update the complete meeting summary using only stated facts. Keep names, numbers, decisions and unresolved items. Use the transcript's primary language and concise Markdown. Never invent facts.",
-            user: "Previous summary:\n\(previous.isEmpty ? "(none)" : previous)\n\nNew transcript only:\n\(transcript)")
+    private var summaryMaxCharacters: Int { settings.summaryMaxCharacters ?? 900 }
+
+    /// Rolling summary: previous summary plus only the new transcript (desktop prompt).
+    func incrementalSummary(previous: String, newSegments: [TranscriptSegment], title: String = "",
+                            mode: String = NotesPrompts.meeting) async throws -> String {
+        let prompt = NotesPrompts.summary(previous: previous, newSegments: newSegments, maxChars: summaryMaxCharacters, title: title, mode: mode)
+        return try await chat(task: "summary", system: prompt.system, user: prompt.user)
     }
 
+    /// Full summary, folded over the transcript in slices exactly like the live summary.
     func fullSummary(_ meeting: Meeting) async throws -> String {
         guard !meeting.segments.isEmpty else { throw AppError.message("Transcribe the meeting first") }
-        let text = Self.render(meeting.segments)
-        let pieces = text.chunked(maxLength: 12_000)
-        if pieces.count == 1 {
-            return try await chat(task: "summary", system: "Summarize this meeting in its primary language. Preserve stated names, numbers, decisions, actions and unresolved questions. Never invent facts.", user: text)
+        var summary = ""
+        for slice in Self.slices(meeting.segments, maxCharacters: Self.summarySliceCharacters) {
+            summary = try await incrementalSummary(previous: summary, newSegments: slice, title: meeting.title, mode: meeting.noteMode)
         }
-        var partials: [String] = []
-        for piece in pieces {
-            partials.append(try await chat(task: "summary", system: "Summarize this portion of a meeting without inventing facts. Preserve names, numbers, decisions and actions.", user: piece))
-        }
-        return try await chat(task: "summary", system: "Combine these partial summaries into complete concise Markdown meeting summary. Do not invent facts.", user: partials.joined(separator: "\n\n---\n\n"))
+        return summary
     }
 
+    /// Structured notes in the desktop JSON schema, rendered to Markdown; non-JSON replies are kept as written.
     func minutes(_ meeting: Meeting) async throws -> (text: String, document: MinutesDocument?) {
         guard !meeting.segments.isEmpty else { throw AppError.message("Transcribe the meeting first") }
-        let transcript = Self.render(meeting.segments)
-        let pieces = transcript.chunked(maxLength: 12_000)
-        let evidence: String
-        if pieces.count == 1 { evidence = transcript }
-        else {
-            var notes: [String] = []
-            for (index, piece) in pieces.enumerated() {
-                let note = try await chat(task: "minutes", system: "Extract factual meeting notes from this portion only. Preserve stated names, dates, decisions, actions, risks, questions and timestamps. Never invent facts. Keep it concise Markdown.",
-                                          user: "Part \(index + 1) of \(pieces.count):\n\(piece)")
-                notes.append(note)
-            }
-            evidence = notes.joined(separator: "\n\n---\n\n")
+        var transcript = NotesPrompts.renderTranscript(meeting.segments)
+        // Desktop sends the whole transcript; only far beyond a typical context window is it condensed first.
+        if transcript.count > Self.minutesFullCharacters {
+            transcript = "（转写过长，以下为按顺序整理的完整要点）\n" + (try await fullSummary(meeting))
         }
-        let schema = """
-        {"title":"one-line topic","abstract":"overview","participants":[],
-         "decisions":[{"decision":"","context":""}],
-         "actionItems":[{"task":"","owner":"TBD","due":"TBD"}],
-         "risks":[{"risk":"","impact":""}],"openQuestions":[],"keywords":[],
-         "chapters":[{"title":"","start":"mm:ss","summary":""}]}
-        """
-        let answer = try await chat(task: "minutes", system: "Write structured meeting minutes using only transcript facts. Preserve names, numbers and timestamps. Never invent participants, decisions, owners or dates. Return one JSON object with this schema and no markdown fences: \(schema)",
-                                    user: "Title: \(meeting.title)\nSummary: \(meeting.summary)\nTranscript evidence:\n\(evidence)")
-        if let start = answer.firstIndex(of: "{"), let end = answer.lastIndex(of: "}"), start <= end,
-           let document = try? JSONDecoder().decode(MinutesDocument.self, from: Data(answer[start...end].utf8)),
-           !document.markdown.isEmpty {
-            return (document.markdown, document)
-        }
-        return (answer, nil)
+        let target = meeting.language.isEmpty || meeting.language == "auto" ? "zh" : meeting.language
+        let prompt = NotesPrompts.minutes(transcript: transcript, title: meeting.title, summary: meeting.summary,
+                                          targetLanguage: target, mode: meeting.noteMode, notesDetail: meeting.noteDetail)
+        let answer = try await chat(task: "minutes", system: prompt.system, user: prompt.user)
+        guard let data = MinutesRenderer.parse(answer) else { return (answer, nil) }
+        let markdown = MinutesRenderer.render(data, mode: meeting.noteMode, language: settings.uiLanguage)
+        let document = (try? JSONSerialization.data(withJSONObject: data)).flatMap { try? JSONDecoder().decode(MinutesDocument.self, from: $0) }
+        return (markdown, document)
     }
 
-    func translate(_ segments: [TranscriptSegment], to language: String) async throws -> [UUID: String] {
+    /// Batches of 20 with the two preceding sentences as context (desktop behaviour).
+    func translate(_ segments: [TranscriptSegment], to language: String, context: [String] = []) async throws -> [UUID: String] {
         guard !segments.isEmpty, !language.isEmpty else { return [:] }
-        let input = segments.map { ["id": $0.id.uuidString, "text": $0.text] }
-        let data = try JSONSerialization.data(withJSONObject: input)
-        let answer = try await chat(task: "translation", system: "Translate every segment into language code \(language). Preserve meaning, tone, names and terms. Return only JSON: {\"translations\":[{\"id\":\"UUID\",\"text\":\"translation\"}]}", user: String(decoding: data, as: UTF8.self))
-        guard let start = answer.firstIndex(of: "{"), let end = answer.lastIndex(of: "}"), start <= end,
-              let result = try JSONSerialization.jsonObject(with: Data(answer[start...end].utf8)) as? [String: Any],
-              let items = result["translations"] as? [[String: Any]] else { throw AppError.message("Translation response was not valid JSON") }
         var map: [UUID: String] = [:]
-        for item in items {
-            if let id = item["id"] as? String, let uuid = UUID(uuidString: id), let text = item["text"] as? String { map[uuid] = text }
+        var before = Array(context.suffix(2))
+        for start in stride(from: 0, to: segments.count, by: Self.translateBatch) {
+            let batch = Array(segments[start..<min(start + Self.translateBatch, segments.count)])
+            let prompt = NotesPrompts.translate(batch.map { ($0.id.uuidString, $0.text) }, target: language, context: before)
+            let answer = try await chat(task: "translation", system: prompt.system, user: prompt.user)
+            guard let result = MinutesRenderer.parse(answer), let items = result["translations"] as? [[String: Any]] else {
+                throw AppError.message("Translation response was not valid JSON")
+            }
+            for item in items {
+                if let id = item["id"] as? String, let uuid = UUID(uuidString: id), let text = item["text"] as? String, !text.isEmpty { map[uuid] = text }
+            }
+            before = batch.suffix(2).map(\.text)
         }
         return map
     }
 
     func answer(_ question: String, meeting: Meeting) async throws -> String {
         guard !meeting.segments.isEmpty else { throw AppError.message("Transcribe the meeting first") }
-        let history = meeting.questions.suffix(4).map { "Q: \($0.question)\nA: \($0.answer)" }.joined(separator: "\n")
-        return try await chat(task: "ask", system: "Answer only from the meeting record. If absent, say so. Cite timestamps when possible. Never invent facts.",
-                              user: "Summary:\n\(meeting.summary)\nTranscript:\n\(Self.render(meeting.segments))\nRecent Q&A:\n\(history)\nQuestion: \(question)")
+        let prompt = NotesPrompts.ask(question, transcript: NotesPrompts.renderTranscript(meeting.segments), summary: meeting.summary,
+                                      history: meeting.questions.map { ($0.question, $0.answer) })
+        return try await chat(task: "ask", system: prompt.system, user: prompt.user)
     }
 
+    /// Text-only speaker attribution in batches of 150, keeping labels consistent across batches.
     func resplitSpeakers(_ segments: [TranscriptSegment]) async throws -> [UUID: String] {
         guard !segments.isEmpty else { return [:] }
-        let input = segments.map { ["id": $0.id.uuidString, "startMs": String($0.startMs), "text": $0.text] }
-        let data = try JSONSerialization.data(withJSONObject: input)
-        let answer = try await chat(task: "speaker", system: "Assign meeting transcript segments to plausible speakers using only linguistic clues such as names, questions, answers and turn-taking. Do not alter the words. If uncertain, retain the original assignment. Return only JSON: {\"assignments\":[{\"id\":\"UUID\",\"speaker\":\"Speaker 1\"}]}",
-                                    user: "Segments:\n\(String(decoding: data, as: UTF8.self))")
-        guard let start = answer.firstIndex(of: "{"), let end = answer.lastIndex(of: "}"), start <= end,
-              let root = try JSONSerialization.jsonObject(with: Data(answer[start...end].utf8)) as? [String: Any],
-              let items = root["assignments"] as? [[String: Any]] else {
-            throw AppError.message("Speaker assignment was not valid JSON")
-        }
+        var known: [String] = []
+        for segment in segments where !segment.speaker.isEmpty && !known.contains(segment.speaker) { known.append(segment.speaker) }
         var result: [UUID: String] = [:]
-        for item in items {
-            if let rawID = item["id"] as? String, let id = UUID(uuidString: rawID),
-               let speaker = item["speaker"] as? String, !speaker.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                result[id] = String(speaker.prefix(80))
+        for start in stride(from: 0, to: segments.count, by: Self.resplitBatch) {
+            let batch = Array(segments[start..<min(start + Self.resplitBatch, segments.count)])
+            let prompt = NotesPrompts.speakerSplit(batch, known: known)
+            let answer = try await chat(task: "speaker", system: prompt.system, user: prompt.user)
+            guard let root = MinutesRenderer.parse(answer), let items = root["assignments"] as? [[String: Any]] else {
+                throw AppError.message("Speaker assignment was not valid JSON")
+            }
+            for item in items {
+                guard let rawID = item["id"] as? String, let id = UUID(uuidString: rawID),
+                      let speaker = (item["speaker"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !speaker.isEmpty else { continue }
+                result[id] = String(speaker.prefix(60))
+                if !known.contains(speaker) { known.append(speaker) }
             }
         }
         return result
+    }
+
+    static let summarySliceCharacters = 24_000
+    static let minutesFullCharacters = 120_000
+    static let translateBatch = 20
+    static let resplitBatch = 150
+
+    static func slices(_ segments: [TranscriptSegment], maxCharacters: Int) -> [[TranscriptSegment]] {
+        var out: [[TranscriptSegment]] = []
+        var current: [TranscriptSegment] = []
+        var size = 0
+        for segment in segments {
+            let length = segment.text.count + 16
+            if !current.isEmpty && size + length > maxCharacters { out.append(current); current = []; size = 0 }
+            current.append(segment)
+            size += length
+        }
+        if !current.isEmpty { out.append(current) }
+        return out
     }
 
     static func render(_ segments: [TranscriptSegment]) -> String {

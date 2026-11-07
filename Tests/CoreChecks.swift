@@ -22,6 +22,74 @@ final class CoreChecks: XCTestCase {
         XCTAssertEqual(meeting.transcript, "你好")
     }
 
+    func testClosedWAVKeepsEverySampleAfterTheHeader() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".wav")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let writer = try WAVWriter(url: url)
+        try writer.append([Int16](repeating: 1_000, count: 16_000))
+        try writer.close()
+        let data = try Data(contentsOf: url)
+        XCTAssertEqual(data.count, 44 + 32_000)
+        XCTAssertEqual(data.prefix(44), WAVWriter.header(bytes: 32_000))
+        XCTAssertEqual(data[44], 0xE8, "the first sample is not overwritten by the header")
+    }
+
+    func testInterruptedRecordingWAVIsRepaired() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".wav")
+        defer { try? FileManager.default.removeItem(at: url) }
+        // What an unclosed WAVWriter leaves: a zero header, one second of
+        // samples and a torn half sample.
+        let writer = try WAVWriter(url: url)
+        try writer.append([Int16](repeating: 1_000, count: 16_000))
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data([7]))
+        try handle.close()
+        XCTAssertEqual(try Data(contentsOf: url).prefix(4), Data(count: 4))
+
+        XCTAssertEqual(try WAVWriter.repair(url: url), 1_000)
+        let data = try Data(contentsOf: url)
+        XCTAssertEqual(data.count, 44 + 32_000)
+        XCTAssertEqual(data.prefix(44), WAVWriter.header(bytes: 32_000))
+        XCTAssertEqual(data[44], 0xE8, "samples are kept")
+        XCTAssertEqual(try WAVWriter.repair(url: url), 1_000, "repair is idempotent")
+
+        let empty = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".wav")
+        defer { try? FileManager.default.removeItem(at: empty) }
+        FileManager.default.createFile(atPath: empty.path, contents: Data(count: 44))
+        XCTAssertEqual(try WAVWriter.repair(url: empty), 0)
+    }
+
+    func testInterruptedMeetingsSettleWithoutClaimingPartialConversions() {
+        var live = Meeting(title: "Live")
+        live.state = "paused"
+        XCTAssertTrue(live.wasInterrupted)
+        live.settleInterruption(recoveredAudioMs: 2_500)
+        XCTAssertEqual(live.state, "stopped")
+        XCTAssertEqual(live.durationMs, 2_500)
+        XCTAssertFalse(live.wasInterrupted)
+
+        var silent = Meeting(title: "No audio")
+        silent.settleInterruption(recoveredAudioMs: 0)
+        XCTAssertEqual(silent.state, "failed")
+
+        var imported = Meeting(title: "Import")
+        imported.source = "import"
+        imported.state = "processing"
+        XCTAssertFalse(imported.isInterruptedLiveRecording)
+        imported.settleInterruption(recoveredAudioMs: 9_000)
+        XCTAssertEqual(imported.state, "failed")
+
+        var screen = Meeting(title: "Screen")
+        screen.source = "screen"
+        screen.settleInterruption(recoveredAudioMs: 9_000)
+        XCTAssertEqual(screen.state, "failed")
+
+        var finished = Meeting(title: "Done")
+        finished.state = "stopped"
+        XCTAssertFalse(finished.wasInterrupted)
+    }
+
     func testExplicitJapaneseNeverRoutesToMiMo() {
         var catalog = ProviderCatalog()
         catalog.asr = catalog.asr.map { provider in

@@ -13,6 +13,9 @@ final class AudioRecorder {
     var onChunk: ((Chunk) -> Void)?
     var onLevel: ((Float) -> Void)?
     var onInterruption: (() -> Void)?
+    /// The recording cannot continue (disk write failed, audio device could not be reopened).
+    /// Called on the main queue at most once per recording.
+    var onFailure: ((String) -> Void)?
     private var engine: AVAudioEngine?
     private var writer: WAVWriter?
     private let queue = DispatchQueue(label: "app.babelecho.audio", qos: .userInitiated)
@@ -29,6 +32,9 @@ final class AudioRecorder {
     private var realtime = RealtimeSettings()
     private var emitChunks = false
     private var interruptionObserver: NSObjectProtocol?
+    private var configurationObserver: NSObjectProtocol?
+    private var resetObserver: NSObjectProtocol?
+    private var failureReported = false
 
     var durationMs: Int { queue.sync { writtenSamples * 1000 / 16_000 } }
     static func wavHeader(bytes: Int) -> Data { WAVWriter.header(bytes: bytes) }
@@ -56,22 +62,8 @@ final class AudioRecorder {
             realtime = settings.realtime ?? RealtimeSettings()
             emitChunks = settings.liveTranscription
 
-            let input = engine.inputNode
-            let format = input.outputFormat(forBus: 0)
-            guard format.sampleRate > 0 else { throw AppError.message("Microphone format is unavailable") }
-            input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self] buffer, _ in
-                guard let self, let channels = buffer.floatChannelData else { return }
-                let frames = Int(buffer.frameLength)
-                let channelCount = Int(buffer.format.channelCount)
-                var mono = [Float](repeating: 0, count: frames)
-                for frame in 0..<frames {
-                    var value: Float = 0
-                    for channel in 0..<channelCount { value += channels[channel][frame] }
-                    mono[frame] = value / Float(max(1, channelCount))
-                }
-                let rate = format.sampleRate
-                self.queue.async { [weak self] in self?.consume(mono, sourceRate: rate) }
-            }
+            failureReported = false
+            try installTap(on: engine)
             tapInstalled = true
             try engine.start()
         } catch {
@@ -85,12 +77,66 @@ final class AudioRecorder {
             throw error
         }
         self.engine = engine
+        // Plugging in headphones, connecting Bluetooth or a sample-rate change stops the engine
+        // and changes the input format. Without this the WAV silently stops growing while the
+        // UI still shows a running recording.
+        configurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
+        ) { [weak self] _ in self?.restartAfterConfigurationChange() }
+        resetObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.reportFailure("Audio services were reset by the system; the recording so far has been saved") }
         interruptionObserver = NotificationCenter.default.addObserver(
             forName: AVAudioSession.interruptionNotification, object: session, queue: .main
         ) { [weak self] notification in
             guard let type = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
                   type == AVAudioSession.InterruptionType.began.rawValue else { return }
             Task { @MainActor in self?.onInterruption?() }
+        }
+    }
+
+    /// Mono mixdown tap in the input node's current format.
+    private func installTap(on engine: AVAudioEngine) throws {
+        let input = engine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        guard format.sampleRate > 0 else { throw AppError.message("Microphone format is unavailable") }
+        input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self] buffer, _ in
+            guard let self, let channels = buffer.floatChannelData else { return }
+            let frames = Int(buffer.frameLength)
+            let channelCount = Int(buffer.format.channelCount)
+            var mono = [Float](repeating: 0, count: frames)
+            for frame in 0..<frames {
+                var value: Float = 0
+                for channel in 0..<channelCount { value += channels[channel][frame] }
+                mono[frame] = value / Float(max(1, channelCount))
+            }
+            let rate = format.sampleRate
+            self.queue.async { [weak self] in self?.consume(mono, sourceRate: rate) }
+        }
+    }
+
+    private func restartAfterConfigurationChange() {
+        guard let engine else { return }
+        engine.inputNode.removeTap(onBus: 0)
+        // The resampler phase belongs to the old input rate.
+        queue.sync {
+            sourcePosition = 0
+            previousSample = 0
+        }
+        do {
+            try installTap(on: engine)
+            engine.prepare()
+            try engine.start()
+        } catch {
+            reportFailure("The audio input changed and could not be reopened; the recording so far has been saved (\(error.localizedDescription))")
+        }
+    }
+
+    private func reportFailure(_ reason: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.failureReported else { return }
+            self.failureReported = true
+            self.onFailure?(reason)
         }
     }
 
@@ -106,8 +152,12 @@ final class AudioRecorder {
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         self.engine = nil
-        if let observer = interruptionObserver { NotificationCenter.default.removeObserver(observer) }
+        for observer in [interruptionObserver, configurationObserver, resetObserver].compactMap({ $0 }) {
+            NotificationCenter.default.removeObserver(observer)
+        }
         interruptionObserver = nil
+        configurationObserver = nil
+        resetObserver = nil
         var result: Result<Int, Error> = .success(0)
         queue.sync {
             do {
@@ -139,7 +189,11 @@ final class AudioRecorder {
         previousSample = input[input.count - 1]
         guard !output.isEmpty else { return }
         do { try writer.append(output) }
-        catch { return }
+        catch {
+            // Usually a full disk. Keep what is already on disk and stop instead of pretending.
+            reportFailure("Could not write the recording (\(error.localizedDescription)); the audio saved so far is kept")
+            return
+        }
         writtenSamples += output.count
         let level = Float(sqrt(output.reduce(0.0) { sum, sample in
             let normalized = Double(sample) / 32768
