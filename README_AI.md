@@ -1,5 +1,7 @@
 # Babel Echo iOS implementation guide
 
+> **Public snapshot.** This repository is the published release snapshot of `apps/ios` from the private Babel Echo development repository; development happens there and each public release is synced here with its source. References below to the monorepo root documents (`AGENTS.md`, `README_AI.md`, `docs/…`) point into that private repository. Downloads: https://github.com/ndof0ssome-114/babelecho-ios/releases
+
 Version: `0.1.0-alpha.3`. Deployment target: iOS 17. No third-party packages.
 
 Read the monorepo root `AGENTS.md` and `README_AI.md`, then this guide. Paths here are relative to `apps/ios`. `PRIVACY.md` and `SECURITY.md` define data handling. Since 2026-11 the monorepo is the source of truth; the standalone `babelecho-ios` repository is a published snapshot (alpha.3) and should only receive exports from here.
